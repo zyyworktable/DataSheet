@@ -1,0 +1,11 @@
+.venv/
+.venv-macos/
+build/
+build-macos/
+build-debug/
+dist/
+dist-windows/
+dist-macos/
+__pycache__/
+*.pyc
+*.spec
