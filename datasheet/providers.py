@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import ssl
 import threading
 import time
@@ -16,6 +17,7 @@ from .sessions import CHINA_TZ, KOREA_TZ, US_TZ, market_now, session_state
 # Import and initialize SSL before urllib builds its default opener. PyInstaller
 # otherwise cannot always infer the dynamic HTTPS handler used by urllib.
 _SSL_CONTEXT = ssl.create_default_context()
+_LOCAL_SSL_CONTEXT = ssl._create_unverified_context()
 
 
 class ProviderError(RuntimeError):
@@ -309,6 +311,197 @@ class YahooUSExtendedProvider:
         return None
 
 
+class IBKROvernightProvider:
+    """Reads US overnight quotes from an authenticated local IBKR gateway.
+
+    The OVERNIGHT venue is deliberately requested explicitly.  IBKR documents
+    that its prices differ from regular SMART-routed market data.  This class
+    is quote-only and never calls order, account or credential endpoints.
+    """
+
+    name = "IBKR隔夜"
+    fields = "31,55,70,71,82,83,84,86,87,7295,7296,7635,7059"
+
+    def __init__(
+        self,
+        base_url: str = "https://localhost:5000/v1/api",
+        timeout: float = 2.0,
+        retry_seconds: float = 30.0,
+    ) -> None:
+        parsed = urllib.parse.urlsplit(base_url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            raise ValueError("IBKR 网关地址必须是本机 HTTPS 地址")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.retry_seconds = retry_seconds
+        self._conids: dict[str, int] = {}
+        self._retry_after = 0.0
+
+    def fetch(self, securities: list[Security]) -> dict[str, QuoteSnapshot]:
+        equities = [
+            item for item in securities if item.region == "US" and item.kind != "index"
+        ]
+        if not equities:
+            return {}
+        if time.monotonic() < self._retry_after:
+            raise ProviderError("IBKR 本地网关未连接")
+        try:
+            snapshots = self._fetch(equities)
+            self._retry_after = 0.0
+            return snapshots
+        except ProviderError:
+            self._retry_after = time.monotonic() + self.retry_seconds
+            raise
+
+    def _fetch(self, securities: list[Security]) -> dict[str, QuoteSnapshot]:
+        status = self._read_json("/iserver/auth/status")
+        if not status.get("authenticated") or status.get("connected") is False:
+            raise ProviderError("IBKR 本地网关尚未登录")
+
+        self._resolve_conids(securities)
+        available = [item for item in securities if item.key in self._conids]
+        if not available:
+            raise ProviderError("IBKR 未识别这些美股代码")
+
+        conid_ex = [f"{self._conids[item.key]}@OVERNIGHT" for item in available]
+        rows = self._snapshot(conid_ex)
+        if not any(self._row_has_price(row) for row in rows):
+            # The first Client Portal snapshot request subscribes the stream;
+            # a short second request obtains the populated fields.
+            time.sleep(0.2)
+            rows = self._snapshot(conid_ex)
+
+        lookup: dict[str, Security] = {}
+        for security in available:
+            conid = self._conids[security.key]
+            lookup[str(conid)] = security
+            lookup[f"{conid}@OVERNIGHT"] = security
+
+        result: dict[str, QuoteSnapshot] = {}
+        for row in rows:
+            key = str(row.get("conidEx") or row.get("conid") or "")
+            security = lookup.get(key) or lookup.get(key.split("@", 1)[0])
+            if not security:
+                continue
+            last = _ibkr_float(row.get("31"))
+            price_kind = "成交价"
+            if last is None:
+                last = _ibkr_float(row.get("7635"))
+                price_kind = "标记价"
+            if last is None:
+                bid = _ibkr_float(row.get("84"))
+                ask = _ibkr_float(row.get("86"))
+                if bid is not None and ask is not None:
+                    last = (bid + ask) / 2
+                    price_kind = "买卖中间价"
+            if last is None:
+                continue
+
+            previous = _ibkr_float(row.get("7296"))
+            change = _ibkr_float(row.get("82"))
+            change_pct = _ibkr_float(row.get("83"))
+            if change is None and previous is not None:
+                change = last - previous
+            if change_pct is None and change is not None and previous:
+                change_pct = change / previous * 100
+
+            updated = _ibkr_float(row.get("_updated"))
+            if updated:
+                timestamp = updated / 1000 if updated > 100_000_000_000 else updated
+                quote_time = datetime.fromtimestamp(timestamp, timezone.utc)
+            else:
+                quote_time = datetime.now(timezone.utc)
+            source = self.name if price_kind == "成交价" else f"{self.name}（{price_kind}）"
+            result[security.key] = QuoteSnapshot(
+                security_key=security.key,
+                name=security.name,
+                last=last,
+                change=change,
+                change_pct=change_pct,
+                open=_ibkr_float(row.get("7295")),
+                high=_ibkr_float(row.get("70")),
+                low=_ibkr_float(row.get("71")),
+                prev_close=previous,
+                volume=_ibkr_float(row.get("87")),
+                quote_time=quote_time,
+                source=source,
+                price_session="隔夜",
+            )
+        if not result:
+            raise ProviderError("IBKR 隔夜行情尚无有效价格")
+        return result
+
+    def _resolve_conids(self, securities: list[Security]) -> None:
+        missing = [item for item in securities if item.key not in self._conids]
+        if not missing:
+            return
+        payload = self._read_json(
+            "/trsrv/stocks", {"symbols": ",".join(item.code for item in missing)}
+        )
+        by_code = {item.code.upper(): item for item in missing}
+        for code, descriptions in (payload or {}).items():
+            security = by_code.get(str(code).upper())
+            if not security:
+                continue
+            candidates: list[dict[str, Any]] = []
+            for description in descriptions or []:
+                if str(description.get("assetClass") or "").upper() != "STK":
+                    continue
+                candidates.extend(description.get("contracts") or [])
+            us_candidates = [row for row in candidates if row.get("isUS") is True]
+            selected = (us_candidates or candidates or [None])[0]
+            if selected and selected.get("conid") is not None:
+                self._conids[security.key] = int(selected["conid"])
+
+    def _snapshot(self, conids: list[str]) -> list[dict[str, Any]]:
+        payload = self._read_json(
+            "/iserver/marketdata/snapshot",
+            {"conids": ",".join(conids), "fields": self.fields},
+        )
+        return payload if isinstance(payload, list) else []
+
+    def _read_json(self, path: str, params: dict[str, str] | None = None) -> Any:
+        query = urllib.parse.urlencode(params or {})
+        url = f"{self.base_url}{path}" + (f"?{query}" if query else "")
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "DataSheet/1.2", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=_LOCAL_SSL_CONTEXT
+            ) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            raise ProviderError(f"IBKR 本地网关连接失败：{exc}") from exc
+
+    @staticmethod
+    def _row_has_price(row: dict[str, Any]) -> bool:
+        return any(_ibkr_float(row.get(field)) is not None for field in ("31", "7635", "84"))
+
+
+def _ibkr_float(value: Any) -> float | None:
+    """Parses IBKR values such as C123.45, 1.2K and +0.31%."""
+
+    if value in (None, "", "-"):
+        return None
+    text = str(value).strip().replace(",", "")
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
+    if not match:
+        return None
+    try:
+        number = float(match.group(0))
+    except ValueError:
+        return None
+    suffix = text[match.end() :].lstrip().upper()[:1]
+    factor = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}.get(suffix, 1)
+    return number * factor
+
+
 class NaverKoreaProvider:
     name = "Naver"
     stock_endpoint = "https://polling.finance.naver.com/api/realtime/domestic/stock/{}"
@@ -517,14 +710,17 @@ class FailoverQuoteService:
 
 
 class QuoteService:
-    """Routes regions independently and overlays US extended-hours trades."""
+    """Routes regions independently and overlays US extended-hours quotes."""
 
-    def __init__(self, primary=None, backup=None, us_extended=None) -> None:
+    def __init__(
+        self, primary=None, backup=None, us_extended=None, us_overnight=None
+    ) -> None:
         # Optional arguments preserve the small injectable surface used by tests.
         self._single = FailoverQuoteService(primary, backup) if primary and backup else None
         self._global = FailoverQuoteService(EastmoneyProvider(), TencentProvider())
         self._korea = FailoverQuoteService(NaverKoreaProvider(), YahooKoreaProvider())
         self._us_extended = us_extended or YahooUSExtendedProvider()
+        self._us_overnight = us_overnight or IBKROvernightProvider()
 
     def fetch(self, securities: list[Security]) -> FetchResult:
         if self._single:
@@ -552,7 +748,25 @@ class QuoteService:
             item for item in securities if item.region == "US" and item.kind != "index"
         ]
         us_state = session_state("US")
-        if us_equities and us_state != "交易中":
+        if us_equities and us_state in {"隔夜", "隔夜收盘"}:
+            try:
+                overnight = self._us_overnight.fetch(us_equities)
+                applied = False
+                for security in us_equities:
+                    supplemental = overnight.get(security.key)
+                    if not supplemental:
+                        continue
+                    snapshots[security.key] = _merge_extended(
+                        snapshots.get(security.key), supplemental
+                    )
+                    applied = True
+                sources.append("IBKR隔夜" if applied else "IBKR隔夜待数据")
+            except ProviderError as exc:
+                # Regular-session prices remain visible, but the row status and
+                # source make clear that there is no live overnight connection.
+                sources.append("IBKR隔夜未连接")
+                errors.append(str(exc))
+        elif us_equities and us_state != "交易中":
             try:
                 extended = self._us_extended.fetch(us_equities)
                 current_us_date = market_now("US").date()
@@ -588,17 +802,18 @@ def _merge_extended(
 ) -> QuoteSnapshot:
     if base is None:
         return supplemental
+    use_overnight_fields = supplemental.price_session == "隔夜"
     return QuoteSnapshot(
         security_key=base.security_key,
         name=supplemental.name or base.name,
         last=supplemental.last,
         change=supplemental.change,
         change_pct=supplemental.change_pct,
-        open=base.open,
-        high=base.high,
-        low=base.low,
+        open=supplemental.open if use_overnight_fields and supplemental.open is not None else base.open,
+        high=supplemental.high if use_overnight_fields and supplemental.high is not None else base.high,
+        low=supplemental.low if use_overnight_fields and supplemental.low is not None else base.low,
         prev_close=base.prev_close or supplemental.prev_close,
-        volume=base.volume,
+        volume=supplemental.volume if use_overnight_fields and supplemental.volume is not None else base.volume,
         amount=base.amount,
         quote_time=supplemental.quote_time,
         source=f"{base.source}+{supplemental.source}" if base.source else supplemental.source,

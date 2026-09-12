@@ -16,6 +16,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "compact": False,
     "always_on_top": False,
     "autostart": False,
+    "ibkr_gateway_url": "https://localhost:5000/v1/api",
     "normal_geometry": None,
 }
 

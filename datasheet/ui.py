@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 
 from .domain import FIXED_SECURITIES, FetchResult, QuoteSnapshot, Security
 from .model import QuoteTableModel
-from .providers import ProviderError, QuoteService
+from .providers import IBKROvernightProvider, ProviderError, QuoteService
 from .sessions import recommended_interval_ms
 from .storage import Storage
 from .symbols import SymbolError, display_code, parse_security
@@ -96,8 +96,20 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.storage = storage
-        self.service = service or QuoteService()
         self.settings = self.storage.settings()
+        if service is not None:
+            self.service = service
+        else:
+            gateway_url = str(
+                self.settings.get("ibkr_gateway_url", "https://localhost:5000/v1/api")
+            )
+            try:
+                overnight = IBKROvernightProvider(gateway_url)
+            except ValueError:
+                gateway_url = "https://localhost:5000/v1/api"
+                self.settings["ibkr_gateway_url"] = gateway_url
+                overnight = IBKROvernightProvider(gateway_url)
+            self.service = QuoteService(us_overnight=overnight)
         self.watchlist = self.storage.watchlist()
         self.snapshots = self.storage.cache()
         self._online = False
@@ -286,6 +298,19 @@ class MainWindow(QMainWindow):
                 objectName="muted",
             )
         )
+        overnight_note = QLabel(
+            "美股隔夜（纽约时间 20:00–03:50）：IBKR Client Portal Gateway。"
+            "程序只读取本机网关的 OVERNIGHT 行情；请先启动网关并完成 IBKR 登录。",
+            objectName="muted",
+        )
+        overnight_note.setWordWrap(True)
+        outer.addWidget(overnight_note)
+        self.ibkr_url_input = QLineEdit(
+            str(self.settings.get("ibkr_gateway_url", "https://localhost:5000/v1/api"))
+        )
+        self.ibkr_url_input.setPlaceholderText("https://localhost:5000/v1/api")
+        self.ibkr_url_input.editingFinished.connect(self._ibkr_url_changed)
+        form.addRow("IBKR 网关地址", self.ibkr_url_input)
         outer.addStretch()
         disclaimer = QLabel(
             "本工具不提供交易功能。公共行情接口没有服务等级保证；如需商业使用或交易所级行情，请更换授权数据源。",
@@ -498,7 +523,7 @@ class MainWindow(QMainWindow):
                 self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
             self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
             self.table.setColumnWidth(2, 130)
-            self.table.setColumnWidth(13, 82)
+            self.table.setColumnWidth(13, 100)
             if self._normal_geometry:
                 self.restoreGeometry(self._normal_geometry)
             elif self.width() < 760:
@@ -520,6 +545,23 @@ class MainWindow(QMainWindow):
         self._save_settings()
         if not self._refresh_in_progress:
             self._schedule_next_refresh()
+
+    @Slot()
+    def _ibkr_url_changed(self) -> None:
+        url = self.ibkr_url_input.text().strip().rstrip("/")
+        try:
+            provider = IBKROvernightProvider(url)
+        except ValueError as exc:
+            self.ibkr_url_input.setText(
+                str(self.settings.get("ibkr_gateway_url", "https://localhost:5000/v1/api"))
+            )
+            QMessageBox.warning(self, "网关地址无效", str(exc))
+            return
+        self.settings["ibkr_gateway_url"] = url
+        self.service._us_overnight = provider
+        self._save_settings()
+        if not self._refresh_in_progress:
+            self.refresh_quotes()
 
     @Slot(bool)
     def _topmost_toggled(self, enabled: bool) -> None:

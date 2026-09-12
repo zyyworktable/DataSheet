@@ -21,6 +21,15 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session_state("US", datetime(2026, 1, 15, 14, 30, tzinfo=timezone.utc)), "交易中")
         self.assertEqual(session_state("US", datetime(2026, 1, 15, 23, 0, tzinfo=timezone.utc)), "盘后")
 
+    def test_us_overnight_crosses_midnight_and_skips_weekend(self):
+        # Sunday 20:01, Monday 03:49 and 03:55 in New York (summer time).
+        self.assertEqual(session_state("US", datetime(2026, 7, 13, 0, 1, tzinfo=timezone.utc)), "隔夜")
+        self.assertEqual(session_state("US", datetime(2026, 7, 13, 7, 49, tzinfo=timezone.utc)), "隔夜")
+        self.assertEqual(session_state("US", datetime(2026, 7, 13, 7, 55, tzinfo=timezone.utc)), "隔夜收盘")
+        # Friday 21:00 and Saturday noon in New York are both closed.
+        self.assertEqual(session_state("US", datetime(2026, 7, 18, 1, 0, tzinfo=timezone.utc)), "已收盘")
+        self.assertEqual(session_state("US", datetime(2026, 7, 18, 16, 0, tzinfo=timezone.utc)), "休市")
+
     def test_us_extended_state_requires_matching_fresh_price(self):
         security = parse_security("AAPL")
         now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
@@ -28,6 +37,14 @@ class SessionTests(unittest.TestCase):
         premarket = QuoteSnapshot(security.key, last=101, quote_time=now, price_session="盘前")
         self.assertEqual(display_state(security, regular, True, now), "盘前待更新")
         self.assertEqual(display_state(security, premarket, True, now), "盘前")
+
+    def test_us_overnight_requires_ibkr_price_stage(self):
+        security = parse_security("AAPL")
+        now = datetime(2026, 7, 13, 1, 0, tzinfo=timezone.utc)
+        regular = QuoteSnapshot(security.key, last=100, quote_time=now, price_session="常规")
+        overnight = QuoteSnapshot(security.key, last=101, quote_time=now, price_session="隔夜")
+        self.assertEqual(display_state(security, regular, True, now), "隔夜待连接")
+        self.assertEqual(display_state(security, overnight, True, now), "隔夜")
 
     def test_korea_regular_session(self):
         self.assertEqual(session_state("KR", datetime(2026, 7, 16, 0, 0, tzinfo=timezone.utc)), "交易中")

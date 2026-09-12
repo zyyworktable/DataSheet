@@ -6,6 +6,7 @@ from unittest.mock import patch
 from datasheet.domain import FetchResult, QuoteSnapshot
 from datasheet.providers import (
     EastmoneyProvider,
+    IBKROvernightProvider,
     NaverKoreaProvider,
     ProviderError,
     QuoteService,
@@ -200,6 +201,51 @@ class ProviderParserTests(unittest.TestCase):
             with self.assertRaises(ProviderError):
                 YahooUSExtendedProvider().fetch([parse_security("AAPL")])
 
+    def test_ibkr_overnight_snapshot_parser_and_routing(self):
+        auth = {"authenticated": True, "connected": True}
+        contracts = {
+            "AAPL": [
+                {
+                    "assetClass": "STK",
+                    "contracts": [
+                        {"conid": 265598, "exchange": "NASDAQ", "isUS": True}
+                    ],
+                }
+            ]
+        }
+        snapshot = [
+            {
+                "conidEx": "265598@OVERNIGHT",
+                "31": "C101.25",
+                "70": "102.00",
+                "71": "99.50",
+                "82": "+1.25",
+                "83": "+1.25%",
+                "87": "1.2K",
+                "7295": "100.20",
+                "7296": "100.00",
+                "_updated": 1_783_908_000_000,
+            }
+        ]
+        responses = [
+            FakeResponse(json.dumps(auth).encode("utf-8")),
+            FakeResponse(json.dumps(contracts).encode("utf-8")),
+            FakeResponse(json.dumps(snapshot).encode("utf-8")),
+        ]
+        with patch("urllib.request.urlopen", side_effect=responses) as opener:
+            result = IBKROvernightProvider().fetch([parse_security("AAPL")])
+        quote = result["US.AAPL"]
+        self.assertEqual(quote.last, 101.25)
+        self.assertEqual(quote.change_pct, 1.25)
+        self.assertEqual(quote.volume, 1200)
+        self.assertEqual(quote.price_session, "隔夜")
+        requested_url = opener.call_args_list[-1].args[0].full_url
+        self.assertIn("%40OVERNIGHT", requested_url)
+
+    def test_ibkr_provider_rejects_non_local_gateway(self):
+        with self.assertRaises(ValueError):
+            IBKROvernightProvider("https://example.com/v1/api")
+
 
 class StubProvider:
     def __init__(self, name, outcomes):
@@ -270,6 +316,50 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(snapshot.price_session, "盘前")
         self.assertEqual(snapshot.source, "东方财富+Yahoo盘前")
         self.assertEqual(result.source, "东方财富｜Yahoo盘前")
+
+    def test_quote_service_overlays_ibkr_overnight_price(self):
+        security = parse_security("AAPL")
+        quote_time = datetime(2026, 7, 13, 1, 0, tzinfo=timezone.utc)
+        base = QuoteSnapshot(
+            security.key,
+            name="Apple",
+            last=100,
+            prev_close=99,
+            source="东方财富",
+        )
+        overnight = QuoteSnapshot(
+            security.key,
+            last=101.5,
+            change=2.5,
+            change_pct=2.53,
+            prev_close=99,
+            quote_time=quote_time,
+            source="IBKR隔夜",
+            price_session="隔夜",
+        )
+        service = QuoteService()
+        service._global = StubService(FetchResult({security.key: base}, "东方财富"))
+        service._us_overnight = StubProvider("IBKR隔夜", [{security.key: overnight}])
+        with patch("datasheet.providers.session_state", return_value="隔夜"):
+            result = service.fetch([security])
+        quote = result.snapshots[security.key]
+        self.assertEqual(quote.last, 101.5)
+        self.assertEqual(quote.price_session, "隔夜")
+        self.assertEqual(result.source, "东方财富｜IBKR隔夜")
+
+    def test_quote_service_keeps_regular_price_when_ibkr_is_not_connected(self):
+        security = parse_security("AAPL")
+        base = QuoteSnapshot(security.key, name="Apple", last=100, source="东方财富")
+        service = QuoteService()
+        service._global = StubService(FetchResult({security.key: base}, "东方财富"))
+        service._us_overnight = StubProvider(
+            "IBKR隔夜", [ProviderError("IBKR 本地网关未连接")]
+        )
+        with patch("datasheet.providers.session_state", return_value="隔夜"):
+            result = service.fetch([security])
+        self.assertEqual(result.snapshots[security.key].last, 100)
+        self.assertIn("IBKR隔夜未连接", result.source)
+        self.assertEqual(result.failed_regions, ())
 
 
 if __name__ == "__main__":
