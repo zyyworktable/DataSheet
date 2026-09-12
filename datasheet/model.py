@@ -72,7 +72,8 @@ class QuoteTableModel(QAbstractTableModel):
             return font
         if role == Qt.ToolTipRole:
             source = snapshot.source if snapshot else "尚无数据"
-            return f"{security.name or security.code}\n行情来源：{source}"
+            price_session = snapshot.price_session if snapshot else "—"
+            return f"{security.name or security.code}\n行情来源：{source}\n价格阶段：{price_session}"
         return None
 
     def _display_value(

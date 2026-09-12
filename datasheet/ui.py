@@ -282,7 +282,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(QLabel("行情源", objectName="title"))
         outer.addWidget(
             QLabel(
-                "A股/美股：东方财富 → 腾讯　　韩股：Naver → Yahoo　　失败后自动切换",
+                "A股/美股常规：东方财富 → 腾讯　　美股盘前/盘后：Yahoo　　韩股：Naver → Yahoo",
                 objectName="muted",
             )
         )

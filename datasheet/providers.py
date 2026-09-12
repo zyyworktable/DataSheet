@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from .domain import FetchResult, QuoteSnapshot, Security
-from .sessions import CHINA_TZ, KOREA_TZ, US_TZ
+from .sessions import CHINA_TZ, KOREA_TZ, US_TZ, market_now, session_state
 
 
 # Import and initialize SSL before urllib builds its default opener. PyInstaller
@@ -213,6 +213,100 @@ class TencentProvider:
             return parsed.replace(tzinfo=US_TZ)
         except ValueError:
             return None
+
+
+class YahooUSExtendedProvider:
+    """Fetches batched US pre-market and after-hours trades from Yahoo Spark."""
+
+    name = "Yahoo扩展时段"
+    endpoint = "https://query1.finance.yahoo.com/v7/finance/spark"
+
+    def fetch(self, securities: list[Security]) -> dict[str, QuoteSnapshot]:
+        equities = [
+            item for item in securities if item.region == "US" and item.kind != "index"
+        ]
+        snapshots: dict[str, QuoteSnapshot] = {}
+        for batch in _chunks(equities, 40):
+            snapshots.update(self._fetch_batch(batch))
+        if equities and not snapshots:
+            raise ProviderError("Yahoo未返回有效的美股扩展时段行情")
+        return snapshots
+
+    def _fetch_batch(self, securities: list[Security]) -> dict[str, QuoteSnapshot]:
+        provider_codes = {
+            security.code.replace(".", "-").upper(): security for security in securities
+        }
+        params = urllib.parse.urlencode(
+            {
+                "symbols": ",".join(provider_codes),
+                "range": "1d",
+                "interval": "1m",
+                "indicators": "close",
+                "includeTimestamps": "true",
+                "includePrePost": "true",
+            }
+        )
+        request = urllib.request.Request(
+            f"{self.endpoint}?{params}",
+            headers={"User-Agent": "Mozilla/5.0 DataSheet/1.0", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=8, context=_SSL_CONTEXT) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            raise ProviderError(f"Yahoo美股扩展行情连接失败：{exc}") from exc
+
+        rows = ((payload or {}).get("spark") or {}).get("result") or []
+        result: dict[str, QuoteSnapshot] = {}
+        for row in rows:
+            security = provider_codes.get(str(row.get("symbol") or "").upper())
+            responses = row.get("response") or []
+            if not security or not responses:
+                continue
+            response = responses[0] or {}
+            meta = response.get("meta") or {}
+            timestamps = response.get("timestamp") or []
+            quote_rows = ((response.get("indicators") or {}).get("quote") or [{}])
+            closes = (quote_rows[0] or {}).get("close") or []
+            latest = next(
+                (
+                    (int(timestamp), _float(price))
+                    for timestamp, price in reversed(list(zip(timestamps, closes)))
+                    if timestamp and _float(price) is not None
+                ),
+                None,
+            )
+            if not latest:
+                continue
+            timestamp, last = latest
+            price_session = self._price_session(timestamp, meta.get("currentTradingPeriod") or {})
+            if price_session not in {"盘前", "盘后"}:
+                continue
+            previous = _float(meta.get("previousClose") or meta.get("chartPreviousClose"))
+            change = last - previous if previous is not None else None
+            change_pct = change / previous * 100 if change is not None and previous else None
+            result[security.key] = QuoteSnapshot(
+                security_key=security.key,
+                name=str(meta.get("longName") or meta.get("shortName") or security.name),
+                last=last,
+                change=change,
+                change_pct=change_pct,
+                prev_close=previous,
+                quote_time=datetime.fromtimestamp(timestamp, timezone.utc),
+                source=f"Yahoo{price_session}",
+                price_session=price_session,
+            )
+        return result
+
+    @staticmethod
+    def _price_session(timestamp: int, periods: dict[str, Any]) -> str | None:
+        for field, label in (("pre", "盘前"), ("post", "盘后")):
+            period = periods.get(field) or {}
+            start = int(period.get("start") or 0)
+            end = int(period.get("end") or 0)
+            if start <= timestamp <= end and start < end:
+                return label
+        return None
 
 
 class NaverKoreaProvider:
@@ -423,13 +517,14 @@ class FailoverQuoteService:
 
 
 class QuoteService:
-    """Routes CN/US and Korea through independent failover pairs."""
+    """Routes regions independently and overlays US extended-hours trades."""
 
-    def __init__(self, primary=None, backup=None) -> None:
+    def __init__(self, primary=None, backup=None, us_extended=None) -> None:
         # Optional arguments preserve the small injectable surface used by tests.
         self._single = FailoverQuoteService(primary, backup) if primary and backup else None
         self._global = FailoverQuoteService(EastmoneyProvider(), TencentProvider())
         self._korea = FailoverQuoteService(NaverKoreaProvider(), YahooKoreaProvider())
+        self._us_extended = us_extended or YahooUSExtendedProvider()
 
     def fetch(self, securities: list[Security]) -> FetchResult:
         if self._single:
@@ -453,9 +548,59 @@ class QuoteService:
             except ProviderError as exc:
                 failed_regions.extend(regions)
                 errors.append(str(exc))
+        us_equities = [
+            item for item in securities if item.region == "US" and item.kind != "index"
+        ]
+        us_state = session_state("US")
+        if us_equities and us_state != "交易中":
+            try:
+                extended = self._us_extended.fetch(us_equities)
+                current_us_date = market_now("US").date()
+                applied_sessions: list[str] = []
+                for security in us_equities:
+                    supplemental = extended.get(security.key)
+                    if not supplemental or not supplemental.quote_time:
+                        continue
+                    if us_state in {"盘前", "盘后"}:
+                        quote_date = supplemental.quote_time.astimezone(US_TZ).date()
+                        if supplemental.price_session != us_state or quote_date != current_us_date:
+                            continue
+                    snapshots[security.key] = _merge_extended(
+                        snapshots.get(security.key), supplemental
+                    )
+                    applied_sessions.append(supplemental.price_session)
+                for price_session in dict.fromkeys(applied_sessions):
+                    sources.append(f"Yahoo{price_session}")
+            except ProviderError as exc:
+                if us_state in {"盘前", "盘后"}:
+                    failed_regions.append("US")
+                    errors.append(str(exc))
         if not snapshots:
             raise ProviderError("；".join(errors) or "没有可查询的证券")
         source = "｜".join(dict.fromkeys(sources))
         if failed_regions:
             source += "｜部分市场离线"
-        return FetchResult(snapshots, source, tuple(failed_regions))
+        return FetchResult(snapshots, source, tuple(dict.fromkeys(failed_regions)))
+
+
+def _merge_extended(
+    base: QuoteSnapshot | None, supplemental: QuoteSnapshot
+) -> QuoteSnapshot:
+    if base is None:
+        return supplemental
+    return QuoteSnapshot(
+        security_key=base.security_key,
+        name=supplemental.name or base.name,
+        last=supplemental.last,
+        change=supplemental.change,
+        change_pct=supplemental.change_pct,
+        open=base.open,
+        high=base.high,
+        low=base.low,
+        prev_close=base.prev_close or supplemental.prev_close,
+        volume=base.volume,
+        amount=base.amount,
+        quote_time=supplemental.quote_time,
+        source=f"{base.source}+{supplemental.source}" if base.source else supplemental.source,
+        price_session=supplemental.price_session,
+    )

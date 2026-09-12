@@ -13,7 +13,13 @@ New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 # selected while PyInstaller resolves Python's _ssl.pyd dependencies.
 $pythonRoot = & $python -c "import sys; print(sys.base_prefix)"
 $pythonDlls = Join-Path $pythonRoot "DLLs"
-$env:PATH = "$pythonDlls;$env:PATH"
+$env:PATH = @(
+    $pythonDlls,
+    $pythonRoot,
+    (Join-Path $env:SystemRoot "System32"),
+    $env:SystemRoot,
+    (Join-Path $env:SystemRoot "System32\Wbem")
+) -join ";"
 
 & $python -m PyInstaller `
     --noconfirm `

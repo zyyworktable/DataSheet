@@ -1,14 +1,16 @@
 import json
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
-from datasheet.domain import QuoteSnapshot
+from datasheet.domain import FetchResult, QuoteSnapshot
 from datasheet.providers import (
     EastmoneyProvider,
     NaverKoreaProvider,
     ProviderError,
     QuoteService,
     TencentProvider,
+    YahooUSExtendedProvider,
     YahooKoreaProvider,
 )
 from datasheet.symbols import parse_security
@@ -133,6 +135,71 @@ class ProviderParserTests(unittest.TestCase):
         self.assertEqual(snapshot.open, 265500)
         self.assertAlmostEqual(snapshot.change_pct, -7.692307, places=5)
 
+    def test_yahoo_us_after_hours_batch_parser(self):
+        payload = {
+            "spark": {
+                "result": [
+                    {
+                        "symbol": "AAPL",
+                        "response": [
+                            {
+                                "meta": {
+                                    "longName": "Apple Inc.",
+                                    "previousClose": 100,
+                                    "currentTradingPeriod": {
+                                        "pre": {"start": 1_000, "end": 2_000},
+                                        "regular": {"start": 2_000, "end": 3_000},
+                                        "post": {"start": 3_000, "end": 4_000},
+                                    },
+                                },
+                                "timestamp": [2_999, 3_100, 3_200],
+                                "indicators": {
+                                    "quote": [{"close": [104, 105, 105.5]}]
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        response = FakeResponse(json.dumps(payload).encode("utf-8"))
+        with patch("urllib.request.urlopen", return_value=response):
+            result = YahooUSExtendedProvider().fetch([parse_security("AAPL")])
+        snapshot = result["US.AAPL"]
+        self.assertEqual(snapshot.last, 105.5)
+        self.assertEqual(snapshot.change, 5.5)
+        self.assertEqual(snapshot.change_pct, 5.5)
+        self.assertEqual(snapshot.price_session, "盘后")
+        self.assertEqual(snapshot.source, "Yahoo盘后")
+
+    def test_yahoo_us_ignores_regular_session_as_extended(self):
+        payload = {
+            "spark": {
+                "result": [
+                    {
+                        "symbol": "AAPL",
+                        "response": [
+                            {
+                                "meta": {
+                                    "currentTradingPeriod": {
+                                        "pre": {"start": 1_000, "end": 2_000},
+                                        "regular": {"start": 2_000, "end": 3_000},
+                                        "post": {"start": 3_000, "end": 4_000},
+                                    }
+                                },
+                                "timestamp": [2_500],
+                                "indicators": {"quote": [{"close": [104]}]},
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        response = FakeResponse(json.dumps(payload).encode("utf-8"))
+        with patch("urllib.request.urlopen", return_value=response):
+            with self.assertRaises(ProviderError):
+                YahooUSExtendedProvider().fetch([parse_security("AAPL")])
+
 
 class StubProvider:
     def __init__(self, name, outcomes):
@@ -148,6 +215,14 @@ class StubProvider:
         return outcome
 
 
+class StubService:
+    def __init__(self, result):
+        self.result = result
+
+    def fetch(self, _securities):
+        return self.result
+
+
 class FailoverTests(unittest.TestCase):
     def test_switches_after_two_primary_failures(self):
         security = parse_security("AAPL")
@@ -161,6 +236,40 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(service.fetch([security]).source, "备源")
         self.assertEqual(primary.calls, 2)
         self.assertEqual(backup.calls, 3)
+
+    def test_quote_service_overlays_fresh_premarket_price(self):
+        security = parse_security("AAPL")
+        quote_time = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        base = QuoteSnapshot(
+            security.key,
+            name="Apple",
+            last=100,
+            prev_close=99,
+            source="东方财富",
+        )
+        extended = QuoteSnapshot(
+            security.key,
+            name="Apple Inc.",
+            last=101,
+            change=2,
+            change_pct=2.02,
+            prev_close=99,
+            quote_time=quote_time,
+            source="Yahoo盘前",
+            price_session="盘前",
+        )
+        service = QuoteService()
+        service._global = StubService(FetchResult({security.key: base}, "东方财富"))
+        service._us_extended = StubProvider("Yahoo扩展时段", [{security.key: extended}])
+        with patch("datasheet.providers.session_state", return_value="盘前"), patch(
+            "datasheet.providers.market_now", return_value=quote_time
+        ):
+            result = service.fetch([security])
+        snapshot = result.snapshots[security.key]
+        self.assertEqual(snapshot.last, 101)
+        self.assertEqual(snapshot.price_session, "盘前")
+        self.assertEqual(snapshot.source, "东方财富+Yahoo盘前")
+        self.assertEqual(result.source, "东方财富｜Yahoo盘前")
 
 
 if __name__ == "__main__":

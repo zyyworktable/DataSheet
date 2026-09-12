@@ -46,6 +46,7 @@ class QuoteSnapshot:
     amount: float | None = None
     quote_time: datetime | None = None
     source: str = ""
+    price_session: str = "常规"
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -69,6 +70,7 @@ class QuoteSnapshot:
             amount=_optional_float(value.get("amount")),
             quote_time=datetime.fromisoformat(quote_time) if quote_time else None,
             source=str(value.get("source", "")),
+            price_session=str(value.get("price_session", "常规")),
         )
 
 

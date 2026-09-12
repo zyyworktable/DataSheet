@@ -33,6 +33,12 @@ def live_smoke(output_path: Path) -> int:
             item.key: {
                 "name": result.snapshots[item.key].name,
                 "last": result.snapshots[item.key].last,
+                "price_session": result.snapshots[item.key].price_session,
+                "quote_time": (
+                    result.snapshots[item.key].quote_time.isoformat()
+                    if result.snapshots[item.key].quote_time
+                    else None
+                ),
             }
             for item in securities
             if item.key in result.snapshots
